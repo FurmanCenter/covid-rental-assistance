@@ -1,0 +1,974 @@
+---
+title: "Covid-19 Occupation Analysis"
+subtitle: "NYU Furman Center"
+output: github_document
+---
+
+Maxwell Austensen ([\@austensen](https://github.com/austensen)) 
+
+The analysis presented here appears in this blog post:
+
+[*TITLE*](URL)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+```
+
+
+```{r install-packages}
+# Install required packages 
+
+# pkgs <- c(
+#   "tidyverse",
+#   "hrbrthemes",
+#   "srvyr",
+#   "knitr",
+#   "rmarkdown",
+#   "gt",
+#   "furrr",
+#   "tictoc"
+# )
+
+# install.packages(pkgs)
+```
+
+
+```{r load-packages-set-options}
+library(tidyverse) # general data manipulation and graphing
+library(scales) # number formatting
+library(srvyr) # survey functions
+library(gt) # making tables
+library(furrr) # parallel processing
+library(tictoc) # timing operations
+
+# Load custom functions to help with plotting
+source("R/utils.R")
+
+# No scientific notation in outputs
+options(scipen = 999)
+
+# To deal with the random assignment of job loss and UI takeup for individuals,
+# we need to run generate the results multiple times with different random seeds
+# and then average the results. To speed this up we use {furrr} to run this in
+# parrallel across multiple cores.
+plan(multiprocess)
+```
+
+
+### Repeated Iterations of Analysis
+
+```{r set-iterations}
+# Number of iterations to run when compiling results
+ITERATIONS <- 100
+```
+
+In our analysis we randomly assign individuals in the data to job loss status and UI recipiency with probabilities based on the industry-specific job loss rates and the UI benefit recipiency rate. To ensure that our final results are not unduly influenced by random variation in those assignment, we repeat the analysis `r comma(ITERATIONS)` times and average the results.
+
+
+### NYS Unemployment Insurance Claims
+
+We use New York State initial unemployment insurance claims data to estimate the percent of workers that have lost their job due to covid by industry category. We accesses these data form the [New York State Department of Labor](https://labor.ny.gov/stats/weekly-ui-claims-report.shtm) and from [this PDF file](https://labor.ny.gov/stats/PDFs/Research-Notes-Initial-Claims-WE-5232020.pdf#page=4) we [transcribed the data](/data/nys_ui-claims_industry_2020-05-23.csv) for the "Over-the-Year Change in Initial Claims by Industry - Cumulative Weeks Ending March 14, 21, 28, April 4, 11, 18, 25, May 2, 9, 16, 23". They note that "These represent the cumulative number of initial claims since they started increasing as a result of the COVID-19 pandemic."
+
+In the the file [`ui-claims.R`](ui-claims.R) we take these count of claims and proportionally redistribute the sizable number of "unclassified" claims across all the industries. Then we 
+
+```{r ui-claims}
+# Create the estimated job loss rates from UI claims
+source("ui-claims.R")
+
+ui_ind_job_loss <- read_csv("data/nys-ui-ind-job-loss.csv", col_types = "cddd")
+
+gt(ui_ind_job_loss) %>% 
+  cols_label(
+    ind_group_ui = "Industry Group", 
+    persons = "Wage Earners (ACS)", 
+    claims = "Initial Claims (NYS UI)", 
+    job_loss_pct = "Job Loss Percent"
+  ) %>% 
+  fmt_number(columns = vars(persons, claims), decimal = 0) %>% 
+  fmt_percent(columns = vars(job_loss_pct), decimal = 1)
+```
+
+### Unemployment Insurance Recipiency Rate
+
+```{r ui-takeup-rate}
+# Assumption about % of people who lost jobs that will receipve UI benefits
+UI_TAKEUP_RATE <- 0.67
+```
+
+Not every person who losses their job will receive unemployment insurance. The reasons for this include:  
+
+* income eligibility  
+* employment type eligibility  
+* immigration status  
+* administrative burden  
+* never applying  
+
+For this analysis we are following the work from [The Century Foundation](https://tcf.org/content/commentary/covid-stimulus-3-0-ui-reaction) and using a UI recipiency rate of `r percent(UI_TAKEUP_RATE)` for New York State.
+
+
+### HUD Area Median Income (AMI)
+
+For our parts of our analysis we restrict to only renter households with incomes below 80% of the Area Median Income (AMI). To incorporate this information we use a file that the Furman Center has prepared from [public HUD data sources](https://www.huduser.gov/portal/datasets/il.html#2018_data) that provides the 80% AMI income cutoff for households of different sizes for every metro area. We'll join this unto the IPUMS data using the county and persons columns (AMIs vary depending on the number of people in the household). 
+
+```{r hud-ami}
+hud_ami <- read_csv("data/hud-2018-ami.csv", col_types = "ddddd")
+```
+
+
+To incorporate the AMI data we need to assign PUMAs to counties first. Since PUMAs don't always nest within counties we use this crosswalk file created by [geocorr](http://mcdc.missouri.edu/applications/geocorr2014.html). This file is created using counts of housing units at the census block level to determine an allocation factor of PUMAs to counties (the share of a PUMA's housing units that fall within a given county). We then assign each PUMA to the county that contains the plurality of its housing units.
+
+```{r county-xwalk}
+puma_county_xwalk <- "data/geocorr_puma2010_county2010.csv" %>% 
+  read_csv(col_names = c("state", "puma", "county", "afact"), col_types = "ddd____d", skip = 2) %>% 
+  mutate(county = as.numeric(str_sub(county, -3))) %>% 
+  arrange(state, puma, desc(afact)) %>% 
+  distinct(state, puma, .keep_all = TRUE)
+```
+
+
+### IPUMS American Community Survey Microdata
+
+All data for this analysis comes from [_IPUMS USA, University of Minnesota_](https://usa.ipums.org/). To build on this analysis and/or replicate it for a different geography, you can sign up for a free account and download your own extract of the data. From the IPUMS USA page, go to _Select Data_ and choose the variables. In addition to to automatically pre-selected variables, you'll to select the following other variables: `statefip`, `puma`, `numprec`, `age`, `ind`, `inctot`, `incwage`, `hhincome`, `ownershp`, `rentgrs`, . Then click _Change Samples_ to select the data sample you want to use (for this analysis we have used ACS 2018 1-year). Once you have all your variables and samples selected, click _View Cart_ and then _Create Extract_. The default options here are fine (format: `.csv`, structure: `Rectangular (person)`), and by default you'll download data for the whole country. You can click _Select Cases_, then `statefip` to export data for only the states you select. Once the request is complete, download the file to the `/data` folder and adjust the following section of code to reflect your file name and filter to your desired geography.
+
+```{r load-ipums}
+# Read in IPUMS USA ACS microdata, standardize the column names
+ipums_raw <- read_csv("data/ipums_acs-2018-1yr_ny.csv.gz") %>% rename_all(str_to_lower)
+```
+
+
+### Prepare Data
+
+First we join the UI claims and HUD AMI data onto the IPUMS data, and create a variety of new variables related to incomes, rents, and household members that will be used in determining eligibility of UI and stimulus benefits and accessing rental assistance need. 
+
+For determining the amount of the stimulus payment received, we have to make a number of simplifying assumptions due to limitations of the data. We calculate eligibility as though each individual is considered alone, and do not account for joint filing. We use each person's total pre-tax income, and if they are the head of the household and there are children in that household, we begin the phaseout of their payment at \$112,000, and for all others \$75,000 is used. For each child we add $500.
+
+For unemployment insurance benefits, we also have to make some simplifying assumptions due to lack of information and eligibility based on their job, immigration status, and quarterly wages. In determining eligibility we assume each person's highest quarterly wages to simply be one quarter of their total annual wages, and then apply the eligibility criteria as defined be New York State. We start by determining eligibility and the amount of UI benefits based solely on wages for every person, and then below once job loss assumptions are incorporated we adjust these based on job losses and UI recipiency rates. 
+ 
+```{r general-calculations}
+# Create all the universal person- and household-level variables for analysis
+
+ipums_clean <- ipums_raw %>% 
+  left_join(puma_county_xwalk, by = c("statefip" = "state", "puma")) %>% 
+  mutate(persons = if_else(numprec > 8, 8, numprec)) %>% 
+  left_join(hud_ami, by = c("statefip" = "state", "county", "persons")) %>% 
+  mutate(
+    ind_group_ui = case_when(
+      between(ind, 8660, 8690) ~ "Accommodation and Food Services",
+      between(ind, 7580, 7790) ~ "Administrative and Support Services",
+      between(ind, 0170, 0290) ~ "Agriculture, Forestry, Fishing and Hunting",
+      between(ind, 8560, 8590) ~ "Arts, Entertainment and Recreation",
+      ind == 0770              ~ "Construction/Utilities",
+      between(ind, 0570, 0690) ~ "Construction/Utilities",
+      between(ind, 7860, 7890) ~ "Educational Services",
+      between(ind, 6870, 6992) ~ "Finance and Insurance",
+      between(ind, 7970, 8470) ~ "Health Care and Social Assistance",
+      between(ind, 6470, 6780) ~ "Information",
+      between(ind, 1070, 3990) ~ "Manufacturing",
+      between(ind, 0370, 0490) ~ "Mining",
+      between(ind, 8770, 9290) ~ "Other Services",
+      between(ind, 7270, 7490) ~ "Professional, Scientific and Technical Services",
+      ind == 7570              ~ "Professional, Scientific and Technical Services",
+      between(ind, 9370, 9590) ~ "Public Administration (Including Government)",
+      between(ind, 7071, 7190) ~ "Real Estate and Rental and Leasing",
+      between(ind, 4670, 5790) ~ "Retail Trade",
+      between(ind, 6070, 6390) ~ "Transportation and Warehousing",
+      between(ind, 4070, 4590) ~ "Wholesale Trade"
+    )
+  ) %>% 
+  left_join(ui_ind_job_loss, by = "ind_group_ui") %>% 
+  filter(
+    # Remove group quarters population
+    gq %in% 1:2 
+  ) %>% 
+  mutate(
+    # Set missing values
+    inc_wages = incwage %>% na_if(999999) %>% na_if(999998) %>% na_if(0),
+    
+    # Household income
+    hh_inc_nom = case_when(
+      hhincome <= 0 ~ 0,
+      hhincome == 9999999 ~ NA_real_, 
+      TRUE ~ hhincome
+    ),
+    hh_inc_grp = cut(
+      hh_inc_nom, c(-Inf, 15e3, 30e3, 50e3, 75e3, 112.5e3, 150e3, Inf),
+      c("< $15k", "$15k - 30k", "$30k - $50k", "$50k - $75k", "$75k - $112.5k", "$112.5k - $150k", ">= $150k"),
+      include.lowest = TRUE, 
+      ordered_result = TRUE
+    ),
+  
+    # Various renter variables. These are household level variables, and will
+    # only be used later after filtering to one row per household.
+    is_renter = (ownershp == 2),
+    gross_rent_nom = if_else(is_renter, rentgrs, NA_real_),
+    gross_rent_grp = cut(
+      gross_rent_nom, 
+      c(-Inf, 600, 1000, 1400, 1800, 2200, Inf),
+      c("< $600", "$600 - 1,000", "$1,000 - $1,400", "$1,400 - $1,800", "$1,800 - $2,200", ">= $2,200"),
+      include.lowest = TRUE, 
+      ordered_result = TRUE
+    ),
+    rent_burden = gross_rent_nom / (hh_inc_nom / 12),
+    is_rent_burdened = (rent_burden > 0.30),
+    is_rent_burdened_sev = (rent_burden > 0.50),
+    is_rent_burdened_mod = (is_rent_burdened) & (!is_rent_burdened_sev),
+    target_burden = if_else(is_rent_burdened, rent_burden, 0.3),
+    
+    child = (age < 18),
+    adult = (age >= 18),
+    per_type = case_when(
+      child ~ "Children",
+      adult ~ "Adults"
+    )
+  ) %>% 
+  group_by(serial) %>% 
+  mutate(
+    num_adults = sum(adult),
+    num_children = sum(child),
+  ) %>% 
+  ungroup() %>% 
+  mutate(
+    
+    # IRS payment
+    per_inc_tot = inctot %>% na_if(9999999) %>% if_else(. < 0, 0, .),
+    phase_out_start = case_when(
+      child ~ NA_real_,
+      pernum == 1 & num_children > 0 ~ 112.5e3,
+      TRUE ~ 75e3
+    ),
+    aid_benefit = case_when(
+      child ~ 500,
+      per_inc_tot <= phase_out_start ~ 1200,
+      TRUE ~ 1200 - ((per_inc_tot - phase_out_start)*0.05)
+    ) %>% 
+      if_else(. < 0, 0, .),
+    
+    # UI benefits
+    # NOTE: these are adjusted below for the different job loss assumptions
+    inc_wages_qtr = inc_wages/4,
+    
+    ui_benefits_month_reg = case_when(
+      inc_wages_qtr <= 2600 ~ 0,
+      inc_wages_qtr <= 3575 ~ if_else(inc_wages_qtr/25 < 104, 104, inc_wages_qtr/25),
+      inc_wages_qtr > 3575 ~ if_else(inc_wages_qtr/26 < 143, 143, inc_wages_qtr/26),
+      TRUE ~ 0
+    ) %>% 
+      if_else(. > 504, 504, .) * 4,
+    
+    ui_benefits_month_600 = if_else(ui_benefits_month_reg > 0, 600, 0) * 4,
+    
+  ) %>% 
+  # Group by household and categorize households based or occupations of members
+  group_by(serial) %>% 
+  mutate(
+    
+    # Total household income from wages
+    hh_inc_wages = sum(inc_wages, na.rm = TRUE),
+    
+    hh_aid_benefits = sum(aid_benefit)
+    
+  ) %>% 
+  ungroup()
+```
+
+
+The analysis is set up to make is easy to use different methodologies for assigning individuals to job loss status. Previous analysis of ours used occupations to designate individuals as being vulnerable to lost employment/wages, and other such as the Terner Center and the Joint Center for Housing Studies have used industries in the same way. 
+
+This function takes the dataset created above with an additional variable called `risk_group` added that identifies an individual as being affected by job loss, and then using that variable in conjunction with the general information above to create new variables related to income loss, UI and stimulus benefits, and rental assistance need. 
+
+As noted above when discussing the unemployment insurance recipiency rate, not everyone who loses their job will receive UI benefits for a variety of reasons. We use `r percent(UI_TAKEUP_RATE)` as the UI recipiency rate, and randomly assign those who lost their jobs to UI receipt with this likelihood (adjusting for those who are deemed ineligible due to wage calculations).
+
+For this analysis rental assistance need is defined as the amount of money required to bring households back to the rent-to-income ratio that they had before loss of income due to job loss, capped at 30% for those households that were previously below that level, and capped at 100%% of their gross rent. 
+
+```{r add-risk-vars}
+add_risk_vars <- function(.data) {
+  
+  .data <- .data %>% 
+    mutate(
+      # If a person has no wages they are excluded from the 
+      risk_group = if_else(is.na(inc_wages), NA, risk_group),
+      risk_group_lab = if_else(risk_group, "More vulnerable", "Less vulnerable"),
+      risk_wages = if_else(risk_group, inc_wages, NA_real_),
+    )
+  
+  # We have a UI_TAKEUP_RATE that we use to determine who gets UI benefits, but
+  # that number includes people who are inelligible. So we need to determine the
+  # % of people who lost jobs who are ineligible and subtract that from the
+  # UI_TAKEUP_RATE used to determine UI receipt among the eligible population
+  # who lost jobs.
+  ui_ineligible_pct <- .data %>% 
+    filter(risk_group) %>% 
+    summarise(
+      jobs_lost = sum(perwt),
+      ui_ineligible = sum(perwt * (ui_benefits_month_reg == 0)),
+      ui_ineligible_pct = ui_ineligible / jobs_lost
+    ) %>% 
+    pull(ui_ineligible_pct)
+  
+  UI_TAKEUP_RATE_ADJ <- UI_TAKEUP_RATE /(1 - ui_ineligible_pct)
+  
+  .data %>% 
+    mutate(
+      # Set UI benefits to 0 if haven't lost job
+      ui_benefits_month_reg = if_else(!risk_group | is.na(risk_group), 0, ui_benefits_month_reg),
+      ui_benefits_month_600 = if_else(!risk_group | is.na(risk_group), 0, ui_benefits_month_600),
+      
+      # First apply the random assignment using the adjusted UI takeup rate
+      ui_takeup = runif(n()) < (UI_TAKEUP_RATE_ADJ),
+      # Then set all the people that are ineligible as not getting UI
+      ui_takeup = if_else(ui_benefits_month_reg == 0, FALSE, ui_takeup),
+      
+      # Now the final UI takeup rate among those who lost there job should now
+      # reflect the UI_TAKEUP_RATE
+      
+      # For those who don't takeup UI, set benefits to 0
+      ui_benefits_month_reg = if_else(ui_takeup, ui_benefits_month_reg, 0),
+      ui_benefits_month_600 = if_else(ui_takeup, ui_benefits_month_600, 0)
+  
+    ) %>%
+    # Group by household and categorize households based or occupations of members
+    group_by(serial) %>%
+    mutate(
+  
+      # Household with at least one wage earner in a more vulnerable occupation
+  
+      # If there are no members with wages then NA, if there are any at-risk
+      # people with wages then TRUE, if there are people with wages but none of
+      # them are at risk then FALSE
+      hh_any_risk = case_when(
+        all(is.na(risk_group)) ~ NA, # no wage earners
+        any(risk_group, na.rm = TRUE) ~ TRUE, # any wage earners are at risk
+        all(!risk_group, na.rm = TRUE) ~ FALSE # all wage earners are at NOT at risk
+      ),
+  
+      # The total wages for each household that come from vulnerable occupations
+      hh_risk_wages = sum(risk_wages, na.rm = TRUE),
+  
+      # The percent of household income that comes from wages from vulnerable occupations
+      hh_risk_wages_pct = sum(risk_wages, na.rm = TRUE) / na_if(hh_inc_nom, 0),
+  
+      # Sum up UI benefits by household
+      hh_ui_benefits_month_reg = sum(ui_benefits_month_reg),
+      hh_ui_benefits_month_600 = sum(ui_benefits_month_600),
+      hh_ui_benefits_month_all = hh_ui_benefits_month_reg + hh_ui_benefits_month_600,
+  
+    ) %>%
+    ungroup() %>%
+    mutate(
+  
+      risk_burden = gross_rent_nom / ((hh_inc_nom - hh_risk_wages) / 12),
+      risk_burden_aid = gross_rent_nom / (((hh_inc_nom - hh_risk_wages) / 12) + hh_aid_benefits),
+      risk_burden_ui_reg = gross_rent_nom / (((hh_inc_nom - hh_risk_wages) / 12) + hh_ui_benefits_month_reg),
+      risk_burden_ui_all = gross_rent_nom / (((hh_inc_nom - hh_risk_wages) / 12) + hh_ui_benefits_month_all),
+      risk_burden_aid_ui_all = gross_rent_nom / (((hh_inc_nom - hh_risk_wages) / 12) + hh_aid_benefits + hh_ui_benefits_month_all),
+  
+      risk_rent_need = ((gross_rent_nom/risk_burden) - (gross_rent_nom/target_burden)),
+      risk_rent_need_aid = ((gross_rent_nom/risk_burden_aid) - (gross_rent_nom/target_burden)),
+      risk_rent_need_ui_reg = ((gross_rent_nom/risk_burden_ui_reg) - (gross_rent_nom/target_burden)),
+      risk_rent_need_ui_all = ((gross_rent_nom/risk_burden_ui_all) - (gross_rent_nom/target_burden)),
+      risk_rent_need_aid_ui_all = ((gross_rent_nom/risk_burden_aid_ui_all) - (gross_rent_nom/target_burden)),
+  
+    ) %>%
+    # Make some adjustments to all the rent_need columns
+    mutate_at(
+      vars(matches("risk_.*rent_need.*")),
+      ~{
+        # note that rent need is expressed as a negative number at first, after this it is positive
+        case_when(
+          is.na(.) ~ 0, # missing change to zero (missing if no cash rent, etc.)
+          . > 0    ~ 0, # positive value for need means they don't have need, set to zero
+          -. > gross_rent_nom ~ gross_rent_nom, # cap needs at the full rent value
+          TRUE ~ -. # change the negative numbers to positive
+        )
+      }
+    )
+  
+}
+```
+
+
+This function takes a dataframe as created by the above `add_risk_vars()` function, and summarizes the household level variables (using survey weights) of interest for a single month. 
+
+```{r summarise-assistance-stats}
+# Preset some arguments for cleaner code below
+survey_total_ci90 <- partial(survey_total, vartype = "ci", level = 0.90)
+survey_mean_ci90 <- partial(survey_mean, vartype = "ci", level = 0.90)
+
+# Summarize the household-level data using survey weights to get estimates for our various indicators. This function is designed so that it can be applied to a dataset created by the above add_risk_vars() function.
+summarise_assistance_stats <- function(.data) {
+  .data %>% 
+    as_survey_design(weights = hhwt) %>% 
+    summarise(
+      renter_households = survey_total_ci90(1),
+      
+      hh_hh_inc_nom_tot_monthly = survey_total_ci90(hh_inc_nom/12),
+      hh_total_wages_tot_monthly = survey_total_ci90(hh_inc_wages/12, na.rm = TRUE),
+      hh_risk_wages_tot_monthly = survey_total_ci90(hh_risk_wages/12),
+      hh_rent_tot_monthly = survey_total_ci90(gross_rent_nom),
+      
+      hh_hh_inc_nom_avg_monthly = survey_mean_ci90(hh_inc_nom/12),
+      hh_total_wages_avg_monthly = survey_mean_ci90(hh_inc_wages/12, na.rm = TRUE),
+      hh_risk_wages_avg_monthly = survey_mean_ci90(hh_risk_wages/12),
+      hh_rent_avg_monthly = survey_mean_ci90(gross_rent_nom),
+      
+      # Stimulus Payments
+      hh_aid_benefits_tot = survey_total_ci90(hh_aid_benefits),
+      hh_aid_benefits_avg = survey_mean_ci90(hh_aid_benefits),
+      
+      # UI Benefits
+      hh_ui_benefits_monthly_reg_tot = survey_total_ci90(hh_ui_benefits_month_reg),
+      hh_ui_benefits_monthly_600_tot = survey_total_ci90(hh_ui_benefits_month_600),
+      hh_ui_benefits_monthly_reg_avg = survey_mean_ci90(hh_ui_benefits_month_reg),
+      hh_ui_benefits_monthly_600_avg = survey_mean_ci90(hh_ui_benefits_month_600),
+      
+      # Rental ASsistance Need (aggregate)
+      hh_rent_need_tot_monthly = survey_total_ci90(risk_rent_need),
+      hh_rent_need_aid_tot_monthly = survey_total_ci90(risk_rent_need_aid),
+      hh_rent_need_ui_reg_tot_monthly = survey_total_ci90(risk_rent_need_ui_reg),
+      hh_rent_need_ui_all_tot_monthly = survey_total_ci90(risk_rent_need_ui_all),
+      hh_rent_need_aid_ui_all_tot_monthly = survey_total_ci90(risk_rent_need_aid_ui_all),
+      
+      # Rental ASsistance Need (average)
+      hh_rent_need_avg_monthly = survey_mean_ci90(risk_rent_need),
+      hh_rent_need_aid_avg_monthly = survey_mean_ci90(risk_rent_need_aid),
+      hh_rent_need_ui_reg_avg_monthly = survey_mean_ci90(risk_rent_need_ui_reg),
+      hh_rent_need_ui_all_avg_monthly = survey_mean_ci90(risk_rent_need_ui_all),
+      hh_rent_need_aid_ui_all_avg_monthly = survey_mean_ci90(risk_rent_need_aid_ui_all)
+    ) %>% 
+    pivot_longer(everything()) %>% 
+    mutate(
+      type = case_when(
+        str_detect(name, "_low") ~ "low",
+        str_detect(name, "_upp") ~ "upp",
+        TRUE ~ "est"
+      ),
+      name = str_remove(name, "(_low|_upp)")
+    ) %>% 
+    pivot_wider(names_from = type, values_from = value) %>% 
+    mutate(moe_90 = upp - est) %>% 
+    select(-low, -upp) %>% 
+    mutate(
+      name = recode(
+        name,
+        "renter_households" = "Total Households",
+        "hh_hh_inc_nom_tot_monthly" = "Monthly Aggregate Household Income",
+        "hh_total_wages_tot_monthly" = "Monthly Aggregate Wages",
+        "hh_risk_wages_tot_monthly" = "Monthly Aggregate Lost Wages",
+        "hh_rent_tot_monthly" = "Monthly Aggregate Gross Rent",
+        "hh_hh_inc_nom_avg_monthly" = "Monthly Average Household Income",
+        "hh_total_wages_avg_monthly" = "Monthly Average Wages",
+        "hh_risk_wages_avg_monthly" = "Monthly Average Lost Wages",
+        "hh_rent_avg_monthly" = "Monthly Average Gross Rent",
+        
+        "hh_aid_benefits_tot" = "Aggregate Stimulus Benefits",
+        "hh_aid_benefits_avg" = "Average Stimulus Benefits",
+        
+        "hh_ui_benefits_monthly_reg_tot" = "Monthly Aggregate Regular UI Benefits",
+        "hh_ui_benefits_monthly_reg_avg" = "Monthly Average Regular UI Benefits",
+        "hh_ui_benefits_monthly_600_tot" = "Monthly Aggregate Enhanced UI Benefits",
+        "hh_ui_benefits_monthly_600_avg" = "Monthly Average Enhanced UI Benefits",
+        
+        "hh_rent_need_tot_monthly" = "Monthly Aggregate Rental Assistance Need (Without Stimulus or UI)",
+        "hh_rent_need_aid_tot_monthly" = "Monthly Aggregate Rental Assistance Need (After Stimulus)",
+        "hh_rent_need_ui_reg_tot_monthly" = "Monthly Aggregate Rental Assistance Need (After Regular UI)",
+        "hh_rent_need_ui_all_tot_monthly" = "Monthly Aggregate Rental Assistance Need (After Enhanced UI)",
+        "hh_rent_need_aid_ui_all_tot_monthly" = "Monthly Aggregate Rental Assistance Need (After Enhanced UI and Stimulus)",
+        
+        "hh_rent_need_avg_monthly" = "Monthly Average Rental Assistance Need (Without Stimulus or UI)",
+        "hh_rent_need_aid_avg_monthly" = "Monthly Average Rental Assistance Need (After Stimulus)",
+        "hh_rent_need_ui_reg_avg_monthly" = "Monthly Average Rental Assistance Need (After Regular UI)",
+        "hh_rent_need_ui_all_avg_monthly" = "Monthly Average Rental Assistance Need (After Enhanced UI)",
+        "hh_rent_need_aid_ui_all_avg_monthly" = "Monthly Average Rental Assistance Need (After Enhanced UI and Stimulus)"
+      )
+    )
+}
+```
+
+This function sets out a few different versions of the results that we would like to use in the final tables. The function takes the `ipums_clean` dataset and a value to use as the seed for random number generation. It then adds the relevant `risk_group` variable to indicate which individuals should be identified as having lost their job. Next we apply the `add_risk_vars()` function to create the variables we need. Then filter to just one row per household and only those households with at least one member assumed to lose their job. Then summarise the results using the `summarise_assistance_stats()` function, and add a new variable to identify what assumptions are used in this version of results. We do this for a variety of assumptions, and then stack the results into a single table. 
+
+To determine which individuals to assume lost their job based on the UI claims data we assign each person a random number between 0 and 1 (uniform distribution) and then compare that number to the estimated job loss rate in their industry and mark them as having lost their job if their random number is low the job loss rate. 
+
+```{r generate-results}
+generate_results <- function(seed, .data) {
+  set.seed(seed)
+  
+  fc_ui_jobs_data <- .data %>% 
+    mutate(risk_group = runif(n()) < job_loss_pct) %>% 
+    add_risk_vars()
+  
+  fc_ui_jobs <- fc_ui_jobs_data %>% 
+    filter(
+      pernum == 1, # keep only one row per household
+      hh_any_risk  # keep only vulnerable households
+    ) %>% 
+    summarise_assistance_stats() %>% 
+    mutate(type = "fc_ui_jobs")
+  
+  fc_ui_jobs_noui <- fc_ui_jobs_data %>%
+    # Include only those who don't get UI benefits
+    filter(hh_ui_benefits_month_reg == 0) %>%
+    filter(
+      pernum == 1, # keep only one row per household
+      hh_any_risk  # keep only vulnerable households
+    ) %>%
+    summarise_assistance_stats() %>%
+    mutate(type = "fc_ui_jobs_noui")
+  
+  fc_ui_jobs_preburdened <- fc_ui_jobs_data %>%
+    # Include only those who were rent burdneded pre-covid
+    filter(is_rent_burdened) %>%
+    filter(
+      pernum == 1, # keep only one row per household
+      hh_any_risk  # keep only vulnerable households
+    ) %>%
+    summarise_assistance_stats() %>%
+    mutate(type = "fc_ui_jobs_preburdened")
+  
+  fc_ui_jobs_presevburdened <- fc_ui_jobs_data %>%
+    # Include only those who were severely rent burdneded pre-covid
+    filter(is_rent_burdened_sev) %>%
+    filter(
+      pernum == 1, # keep only one row per household
+      hh_any_risk  # keep only vulnerable households
+    ) %>%
+    summarise_assistance_stats() %>%
+    mutate(type = "fc_ui_jobs_presevburdened")
+  
+  fc_ui_jobs_return25 <- .data %>% 
+    # Assume that 25% of people who lost jobs return to them
+    mutate(risk_group = runif(n()) < (job_loss_pct - (job_loss_pct*0.25))) %>% 
+    add_risk_vars() %>% 
+    filter(
+      pernum == 1, # keep only one row per household
+      hh_any_risk  # keep only vulnerable households
+    ) %>% 
+    summarise_assistance_stats() %>% 
+    mutate(type = "fc_ui_jobs_return25")
+  
+  fc_ui_jobs_return50 <- .data %>% 
+    # Assume that 50% of people who lost jobs return to them
+    mutate(risk_group = runif(n()) < (job_loss_pct - (job_loss_pct*0.50))) %>% 
+    add_risk_vars() %>% 
+    filter(
+      pernum == 1, # keep only one row per household
+      hh_any_risk  # keep only vulnerable households
+    ) %>% 
+    summarise_assistance_stats() %>% 
+    mutate(type = "fc_ui_jobs_return50")
+  
+  
+  bind_rows(
+    fc_ui_jobs,
+    fc_ui_jobs_noui,
+    fc_ui_jobs_preburdened,
+    fc_ui_jobs_presevburdened,
+    fc_ui_jobs_return25,
+    fc_ui_jobs_return50
+  ) %>% 
+    mutate(seed = seed)
+  
+}
+```
+
+This function takes the dataframe created by the above `generate_results()` function and reformat the data and creates a table of the results. 
+
+> *NOTE: The margin of error columns are currently being hidden for readability, but un-commenting those portions and remove the `cols_hide()` line will add them back.*
+
+```{r make-table}
+# Take the agerage of all the results for the multiple iterations and then
+# create a single table to compare the methodologies
+table_rows <- c(
+  "Total Households",
+  "Monthly Aggregate Household Income",
+  "Monthly Aggregate Wages",
+  "Monthly Aggregate Lost Wages",
+  "Monthly Aggregate Gross Rent",
+  "Monthly Average Household Income",
+  "Monthly Average Wages",
+  "Monthly Average Lost Wages",
+  "Monthly Average Gross Rent",
+          
+  "Aggregate Stimulus Benefits",
+  "Average Stimulus Benefits",
+          
+  "Monthly Aggregate Regular UI Benefits",
+  "Monthly Average Regular UI Benefits",
+  "Monthly Aggregate Enhanced UI Benefits",
+  "Monthly Average Enhanced UI Benefits",
+          
+  "Monthly Aggregate Rental Assistance Need (Without Stimulus or UI)",
+  "Monthly Aggregate Rental Assistance Need (After Stimulus)",
+  "Monthly Aggregate Rental Assistance Need (After Regular UI)",
+  "Monthly Aggregate Rental Assistance Need (After Enhanced UI)",
+  "Monthly Aggregate Rental Assistance Need (After Enhanced UI and Stimulus)",
+          
+  "Monthly Average Rental Assistance Need (Without Stimulus or UI)",
+  "Monthly Average Rental Assistance Need (After Stimulus)",
+  "Monthly Average Rental Assistance Need (After Regular UI)",
+  "Monthly Average Rental Assistance Need (After Enhanced UI)",
+  "Monthly Average Rental Assistance Need (After Enhanced UI and Stimulus)"
+)
+
+make_table <- function(.data) {
+  .data %>% 
+    group_by(type, name) %>% 
+    summarise_at(vars(est, moe_90), mean) %>% 
+    pivot_longer(cols = all_of(c("est", "moe_90")), names_to = "measure") %>% 
+    unite(type_measure,type, measure, sep = "__") %>% 
+    pivot_wider(name, type_measure) %>% 
+    mutate(name = ordered(name, levels = table_rows)) %>% 
+    arrange(name) %>% 
+    gt() %>%
+    tab_spanner(label = md("**UI Job Loss, No Return**"), columns = starts_with("fc_ui_jobs")) %>% 
+    tab_spanner(label = md("**UI Job Loss, No Return, No UI HHs**"), columns = starts_with("fc_ui_jobs_noui")) %>% 
+    tab_spanner(label = md("**UI Job Loss, No Return, Rent Burdened HHs**"), columns = starts_with("fc_ui_jobs_preburdened")) %>% 
+    tab_spanner(label = md("**UI Job Loss, No Return, Severely Rent Burdened HHs**"), columns = starts_with("fc_ui_jobs_presevburdened")) %>% 
+    tab_spanner(label = md("**UI Job Loss, 25% Return**"), columns = starts_with("fc_ui_jobs_return25")) %>% 
+    tab_spanner(label = md("**UI Job Loss, 50% Return**"), columns = starts_with("fc_ui_jobs_return50")) %>% 
+    cols_label(
+      name = "", 
+      fc_ui_jobs__est = "Estimate", fc_ui_jobs__moe_90 = "MOE (90%)",
+      fc_ui_jobs_noui__est = "Estimate", fc_ui_jobs_noui__moe_90 = "MOE (90%)",
+      fc_ui_jobs_preburdened__est = "Estimate", fc_ui_jobs_preburdened__moe_90 = "MOE (90%)",
+      fc_ui_jobs_presevburdened__est = "Estimate", fc_ui_jobs_presevburdened__moe_90 = "MOE (90%)",
+      fc_ui_jobs_return25__est = "Estimate", fc_ui_jobs_return25__moe_90 = "MOE (90%)",
+      fc_ui_jobs_return50__est = "Estimate", fc_ui_jobs_return50__moe_90 = "MOE (90%)",
+    ) %>% 
+    # Show/Hide MOE columns
+    cols_hide(columns = ends_with("moe_90")) %>%
+    tab_row_group(group = "Total", rows = matches("Total")) %>% 
+    tab_row_group(group = "Aggregate", rows = matches("Aggregate")) %>% 
+    tab_row_group(group = "Average", rows = matches("Average")) %>% 
+    row_group_order(c("Total", "Aggregate", "Average")) %>% 
+    cols_align("left", columns = vars(name)) %>% 
+    fmt_number(columns = matches("(est|moe).*"), rows = str_detect(name, "^Total"), decimal = 0) %>% 
+    fmt_currency(columns = matches("(est|moe).*"), rows = str_detect(name, "Aggregate|Average"), suffixing = c(NA, "M", "B", "T")) %>% 
+    tab_source_note(str_glue("Notes: Assignment of individuals to UI take-up status is done randomly with a {percent(UI_TAKEUP_RATE)} likelihood, accounting for those deemed ineligible based on income criteria. Assignment of individuals to job loss status is done randomly with a likelihood based on the industry specific UI claims and job loss estimates. All of the results show here are the averages of {ITERATIONS} iterations of the estimations."))
+
+}
+```
+
+
+---
+
+<br>
+
+## Results Tables
+
+
+
+
+### All NYS Affected Renter Households
+
+```{r run-nys-all}
+table_nys <- seq_len(ITERATIONS) %>% 
+  future_map_dfr(
+    .f = generate_results, 
+    .data = filter(ipums_clean, is_renter)
+  )
+```
+
+```{r nys-all-agg-table}
+table_nys %>% 
+  filter(str_detect(name, "(Total|Aggregate)")) %>% 
+  make_table() %>% 
+  tab_header(
+    title = "Affected Renter Households", 
+    subtitle = "New York State - Aggregates"
+  )
+```
+
+```{r nys-all-avg-table}
+table_nys %>% 
+  filter(str_detect(name, "(Total|Average)")) %>% 
+  make_table() %>% 
+  tab_header(
+    title = "Affected Renter Households", 
+    subtitle = "New York State - Averages"
+  )
+```
+
+
+---
+
+<br>
+
+### All NYS Affected Renter Households with Incomes below 80% of AMI
+
+```{r run-nys-lt80}
+table_nys_lt80ami <- seq_len(ITERATIONS) %>% 
+  future_map_dfr(
+    .f = generate_results, 
+    .data = filter(ipums_clean, is_renter, hh_inc_nom < hud_inc_lim80)
+  )
+```
+
+```{r nys-lt80-agg-table}
+table_nys_lt80ami %>% 
+  filter(str_detect(name, "(Total|Aggregate)")) %>% 
+  make_table() %>% 
+  tab_header(
+    title = "Affected Renter Households with Incomes below 80% of AMI", 
+    subtitle = "New York State - Aggregates"
+  )
+```
+
+```{r nys-lt80-avg-table}
+table_nys_lt80ami %>% 
+  filter(str_detect(name, "(Total|Average)")) %>% 
+  make_table() %>% 
+  tab_header(
+    title = "Affected Renter Households with Incomes below 80% of AMI", 
+    subtitle = "New York State - Averages"
+  )
+```
+
+---
+
+<br>
+
+### All NYC Affected Renter Households
+
+```{r run-nyc-all}
+nyc_counties <- c(5, 47, 61, 81, 85)
+
+table_nyc <- seq_len(ITERATIONS) %>% 
+  future_map_dfr(
+    .f = generate_results, 
+    .data = filter(ipums_clean, is_renter, county %in% nyc_counties)
+  )
+```
+
+```{r nyc-all-agg-table}
+table_nyc %>% 
+  filter(str_detect(name, "(Total|Aggregate)")) %>% 
+  make_table() %>% 
+  tab_header(
+    title = "Affected Renter Households", 
+    subtitle = "New York City - Aggregates"
+  )
+```
+
+```{r nyc-all-avg-table}
+table_nyc %>% 
+  filter(str_detect(name, "(Total|Average)")) %>% 
+  make_table() %>% 
+  tab_header(
+    title = "Affected Renter Households", 
+    subtitle = "New York City - Averages"
+  )
+```
+
+---
+
+<br>
+
+### All NYC Affected Renter Households with Incomes below 80% of AMI
+
+```{r run-nyc-lt80}
+nyc_counties <- c(5, 47, 61, 81, 85)
+
+table_nyc_lt80ami <- seq_len(ITERATIONS) %>% 
+  future_map_dfr(
+    .f = generate_results, 
+    .data = filter(ipums_clean, is_renter, hh_inc_nom < hud_inc_lim80, county %in% nyc_counties)
+  )
+```
+
+```{r nyc-lt80-agg-table}
+table_nyc_lt80ami %>% 
+  filter(str_detect(name, "(Total|Aggregate)")) %>% 
+  make_table() %>% 
+  tab_header(
+    title = "Affected Renter Households with Incomes below 80% of AMI", 
+    subtitle = "New York City - Aggregates"
+  )
+```
+
+```{r nyc-lt80-avg-table}
+table_nyc_lt80ami %>% 
+  filter(str_detect(name, "(Total|Average)")) %>% 
+  make_table() %>% 
+  tab_header(
+    title = "Affected Renter Households with Incomes below 80% of AMI", 
+    subtitle = "New York City - Averages"
+  )
+```
+
+---
+
+<br>
+
+## Plots
+
+These plots present a few of the key estimates from the above tables. For NYS and NYC, and for all renter households and just those below 80% AMI pre-covid, we show the total monthly rental assistance need with and without the enhanced UI benefits under the CARES Act.
+
+
+```{r plot-data}
+plot_keep_types <- c("fc_ui_jobs", "fc_ui_jobs_return25", "fc_ui_jobs_return50")
+
+plot_keep_names <- c(
+  "Monthly Aggregate Rental Assistance Need (After Enhanced UI)" = "With Enhanced Benefits",
+  "Monthly Aggregate Rental Assistance Need (After Regular UI)" = "Without Enhanced Benefits"
+)
+
+plot_source_tables <- list(
+  "New York State\nAll Renter Households" = table_nys,
+  "New York State\n<80%AMI Renter Households" = table_nys_lt80ami,
+  "New York City\nAll Renter Households" = table_nyc,
+  "New York City\n<80%AMI Renter Households" = table_nyc_lt80ami
+)
+
+plot_data <- plot_source_tables %>% 
+  imap_dfr(~{
+    .x %>% 
+      filter(
+        type %in% plot_keep_types,
+        name %in% names(plot_keep_names)
+      ) %>% 
+      transmute(
+        group = .y,
+        type,
+        name = recode(name, !!!plot_keep_names),
+        est,
+        moe_90
+      )
+  }) %>% 
+  mutate(
+    group = ordered(group, levels = names(plot_source_tables)),
+    name = ordered(name, levels = plot_keep_names),
+  )
+```
+
+```{r plot-0-recovery}
+p <- plot_data %>% 
+  filter(type == "fc_ui_jobs") %>% 
+  group_by(group, name) %>% 
+  summarise_at(vars(est, moe_90), mean) %>% 
+  fc_col_plot_cluster(
+    x = group, 
+    y = est, 
+    fill = name, 
+    y_limits = c(0, 1.1e9), 
+    ymin = est - moe_90,
+    ymax = est + moe_90
+  ) +
+  scale_fill_manual(values = c("#D1D1D1", "#559C9E")) +
+  labs(
+    title = "Total Monthly Rental Assistance Need",
+    subtitle = "Assuming No Job Recovery",
+    y = NULL, x = NULL,
+    fill = NULL,
+    caption = str_glue(
+      "Notes: All results include estimates of households that do not claim UI benefits but are likely to have experienced job loss.
+      Error bars represent 90% confidence intervals, and value labels reflect point estimates. 
+      
+      Sources: American Community Survey (2018) via IPUMS USA, NYS Dept. of Labor, NYU Furman Center"
+    )
+  )
+
+plot_save_include("img/covid-rental-assistance-need-0-recovery.png")
+```
+
+```{r plot-25-recovery}
+p <- plot_data %>% 
+  filter(type == "fc_ui_jobs_return25") %>% 
+  group_by(group, name) %>% 
+  summarise_at(vars(est, moe_90), mean) %>% 
+  fc_col_plot_cluster(
+    x = group, 
+    y = est, 
+    fill = name, 
+    y_limits = c(0, 1.1e9), 
+    ymin = est - moe_90,
+    ymax = est + moe_90
+  ) +
+  scale_fill_manual(values = c("#D1D1D1", "#559C9E")) +
+  labs(
+    title = "Total Monthly Rental Assistance Need",
+    subtitle = "Assuming 25% Job Recovery",
+    y = NULL, x = NULL,
+    fill = NULL,
+    caption = str_glue(
+      "Notes: All results include estimates of households that do not claim UI benefits but are likely to have experienced job loss.
+      Error bars represent 90% confidence intervals, and value labels reflect point estimates. 
+      
+      Sources: American Community Survey (2018) via IPUMS USA, NYS Dept. of Labor, NYU Furman Center"
+    )
+  )
+
+plot_save_include("img/covid-rental-assistance-need-25-recovery.png")
+```
+
+```{r plot-50-recovery}
+p <- plot_data %>% 
+  filter(type == "fc_ui_jobs_return50") %>% 
+  group_by(group, name) %>% 
+  summarise_at(vars(est, moe_90), mean) %>% 
+  fc_col_plot_cluster(
+    x = group, 
+    y = est, 
+    fill = name, 
+    y_limits = c(0, 1.1e9), 
+    ymin = est - moe_90,
+    ymax = est + moe_90
+  ) +
+  scale_fill_manual(values = c("#D1D1D1", "#559C9E")) +
+  labs(
+    title = "Total Monthly Rental Assistance Need",
+    subtitle = "Assuming 50% Job Recovery",
+    y = NULL, x = NULL,
+    fill = NULL,
+    caption = str_glue(
+      "Notes: All results include estimates of households that do not claim UI benefits but are likely to have experienced job loss.
+      Error bars represent 90% confidence intervals, and value labels reflect point estimates. 
+      
+      Sources: American Community Survey (2018) via IPUMS USA, NYS Dept. of Labor, NYU Furman Center"
+    )
+  )
+  
+plot_save_include("img/covid-rental-assistance-need-50-recovery.png")
+```
+
+---
+
+<br>
+
+### NYS basic stats
+
+```{r nys-basic-stats}
+ipums_clean %>% 
+  filter(pernum == 1) %>% 
+  as_survey_design(weights = "hhwt") %>% 
+  summarise(
+    hh_renter_num = survey_total(is_renter),
+    hh_owner_num = survey_total(!is_renter),
+    hh_renter_lt80ami_num = survey_total(is_renter & (hh_inc_nom < hud_inc_lim80)),
+    hh_owner_lt80ami_num = survey_total(!is_renter & (hh_inc_nom < hud_inc_lim80))
+  ) %>% 
+  select(-ends_with("_se")) %>% 
+  pivot_longer(everything())
+```
+
+### NYC basic stats
+
+```{r nyc-basic-stats}
+ipums_clean %>% 
+  filter(pernum == 1) %>% 
+  filter(county %in% nyc_counties) %>% 
+  as_survey_design(weights = "hhwt") %>% 
+  summarise(
+    hh_renter_num = survey_total(is_renter),
+    hh_owner_num = survey_total(!is_renter),
+    hh_renter_lt80ami_num = survey_total(is_renter & (hh_inc_nom < hud_inc_lim80)),
+    hh_owner_lt80ami_num = survey_total(!is_renter & (hh_inc_nom < hud_inc_lim80))
+  ) %>% 
+  select(-ends_with("_se")) %>% 
+  pivot_longer(everything())
+```
+
