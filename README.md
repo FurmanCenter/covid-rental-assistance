@@ -1,11 +1,11 @@
-Covid-19 Occupation Analysis
+Covid-19 Rental Assistance
 ================
 
 Maxwell Austensen ([@austensen](https://github.com/austensen))
 
 The analysis presented here appears in this blog post:
 
-[*TITLE*](URL)
+[*Understanding the Potential Magnitude of Rent Shortfalls in New York State and New York Due to COVID*](https://furmancenter.org/thestoop/entry/understanding-the-potential-magnitude-of-rent-shortfalls-in-new-york-state)
 
 ``` r
 # Install required packages 
