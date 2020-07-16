@@ -7628,10 +7628,10 @@ p <- plot_data %>%
     )
   )
 
-plot_save_include("img/rental-assistance-need-0-recovery.png")
+plot_save_include("img/covid-rental-assistance-need-0-recovery.png")
 ```
 
-![](img/rental-assistance-need-0-recovery.png)<!-- -->
+![](img/covid-rental-assistance-need-0-recovery.png)<!-- -->
 
 ``` r
 p <- plot_data %>% 
@@ -7660,10 +7660,10 @@ p <- plot_data %>%
     )
   )
 
-plot_save_include("img/rental-assistance-need-25-recovery.png")
+plot_save_include("img/covid-rental-assistance-need-25-recovery.png")
 ```
 
-![](img/rental-assistance-need-25-recovery.png)<!-- -->
+![](img/covid-rental-assistance-need-25-recovery.png)<!-- -->
 
 ``` r
 p <- plot_data %>% 
@@ -7692,10 +7692,10 @@ p <- plot_data %>%
     )
   )
   
-plot_save_include("img/rental-assistance-need-50-recovery.png")
+plot_save_include("img/covid-rental-assistance-need-50-recovery.png")
 ```
 
-![](img/rental-assistance-need-50-recovery.png)<!-- -->
+![](img/covid-rental-assistance-need-50-recovery.png)<!-- -->
 
 -----
 
